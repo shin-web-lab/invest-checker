@@ -9,25 +9,25 @@
 <body>
   <div class="container">
     <h1>投資標的每日檢查</h1>
-    <h3>本工具使用每日收盤價計算，建議於收盤後查看，一天看一次即可，用來觀察趨勢狀態，不適合盤中即時交易。</h3>
     <button id="update-btn" type="button">更新</button>
     <div id="error-box" class="error-banner" role="alert" hidden></div>
     <div id="cards" class="cards-grid"></div>
     <section class="info-section">
       <h2>使用說明</h2>
       <ul>
-        <li>MA20：最近 20 日的平均價，可當作市場合理價位的參考。</li>
+        <li>MA：依策略使用不同週期（短期 MA5/MA10、中期 MA20、長期 MA60/MA120）的平均價，作為趨勢基準。</li>
         <li>乖離率：代表現在價格離均線有多遠，正數表示高於均線，負數表示低於均線。</li>
         <li>紅黃綠燈：
           <ul>
-            <li>🟢 趨勢：順勢區，可考慮布局或續抱。<span>乖離率大於 +2% 且 MA20 走平或上彎</span></li>
-            <li>🟡 接近：方向不明，建議觀察等待，不適合加碼。<span>乖離率在 -2% 到 +2%（含邊界）</span></li>
-            <li>🔴 跌破：趨勢轉弱，不建議進場。<span>乖離率小於 -2%，或乖離率大於 +2% 但 MA20 下彎</span></li>
+            <li>🟢 趨勢：順勢區，可考慮布局或續抱。</li>
+            <li>🟡 接近：方向不明，建議觀察等待，不適合加碼。</li>
+            <li>🔴 跌破：趨勢轉弱，不建議進場。</li>
           </ul>
         </li>
-
-        <li class="notice">提醒：本工具僅供技術參考，非投資建議，資料來源 Yahoo Finance。</li>
+        <li>資料不足時會顯示累積天數，代表尚未達到計算訊號的最低需求。</li>
+        <li class="notice">提醒：本工具僅供技術參考，非投資建議，資料來源依標的設定為 TWSE／TPEx／Yahoo。</li>
       </ul>
+      <p class="info-note"><span class="alert-icon">!</span>本工具使用每日收盤價計算，建議於收盤後查看，一天看一次即可；長／中／短期策略差異僅在使用的 MA 週期不同。</p>
     </section>
   </div>
   <script src="app.js" defer></script>

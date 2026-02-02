@@ -82,10 +82,7 @@ button:disabled {
   margin: 6px 0;
   line-height: 1.5;
 }
-.info-section li span {
-  font-size: 70%;
-  opacity: 0.7;
-}
+
 .info-section ul ul {
   margin-top: 6px;
   list-style: circle;
@@ -96,11 +93,10 @@ button:disabled {
   color: #444;
 }
 
-.notice-heading {
+.info-note {
   margin: 12px 0 0;
-  font-size: 16px;
-  font-weight: 600;
   color: #b71c1c;
+  font-weight: 600;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -139,6 +135,12 @@ button:disabled {
   gap: 12px;
 }
 
+.card-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .card-title {
   display: flex;
   gap: 8px;
@@ -154,6 +156,53 @@ button:disabled {
 .card-title .name {
   font-size: 16px;
   color: #444;
+}
+
+.card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.strategy-badge {
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  -webkit-border-radius: 4px;
+  -moz-border-radius: 4px;
+  -ms-border-radius: 4px;
+  -o-border-radius: 4px;
+}
+
+.strategy-long {
+  background: #ebebeb;
+  color: #0d47a1;
+}
+
+.strategy-mid {
+  background: #ebebeb;
+  color: #0087b4;
+}
+
+.strategy-short {
+  background: #ebebeb;
+  color: #e69600;
+}
+
+.ma-period {
+  font-size: 12px;
+  font-weight: 700;
+  color: #555;
+}
+
+.source-tag {
+  font-size: 12px;
+  color: #666;
+  background: #f1f1f1;
+  padding: 2px 8px;
+  border-radius: 999px;
 }
 
 .card-status {
@@ -177,7 +226,7 @@ button:disabled {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
 }
 
@@ -234,8 +283,22 @@ button:disabled {
   background: #c0c0c0;
 }
 
+.status-neutral {
+  background: #eceff1;
+  color: #455a64;
+}
+
+.status-bar.status-neutral {
+  background: #90a4ae;
+}
+
 .card.error {
   border-color: #d6d6d6;
+}
+
+.card.loading {
+  border-color: #e0e0e0;
+  box-shadow: none;
 }
 
 @media (max-width: 768px) {
