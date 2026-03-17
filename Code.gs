@@ -3,9 +3,17 @@ const SHEET_NAME = "REPLACE_ME";
 
 const TICKERS_CACHE_KEY = "tickers_cache_v2";
 const QUOTES_CACHE_KEY = "quotes_cache_v2";
+const MARKET_CACHE_KEY = "market_cache_v1";
 const TICKERS_CACHE_TTL = 600;
-const QUOTES_CACHE_TTL = 180;
+const QUOTES_CACHE_TTL = 600; // 延長至 10 分鐘，配合觸發器預熱頻率
+const MARKET_CACHE_TTL = 600;
 const ENABLE_YAHOO_FALLBACK = true;
+
+const MARKET_SYMBOLS = [
+  { symbol: "^TWII",  key: "twii",   name: "台股大盤",          range: "6mo" },
+  { symbol: "^GSPC",  key: "gspc",   name: "美股 S&P 500",      range: "6mo" },
+  { symbol: "TWD=X",  key: "twdusd", name: "台幣匯率 (USD/TWD)", range: "6mo" },
+];
 
 const TWSE_MONTHLY_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY";
 const TPEX_MONTHLY_URL = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php";
@@ -29,6 +37,10 @@ function doGet(e) {
 
   if (action === "quotes") {
     return jsonResponse(getQuotesBatch());
+  }
+
+  if (action === "market") {
+    return jsonResponse(getMarketData());
   }
 
   if (code) {
@@ -498,4 +510,104 @@ function jsonResponse(payload) {
   return ContentService
     .createTextOutput(JSON.stringify(payload))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ─── 市場總覽 ────────────────────────────────────────────────────────────────
+
+function getMarketData() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(MARKET_CACHE_KEY);
+  if (cached) {
+    const payload = JSON.parse(cached);
+    payload.meta.cacheHit = true;
+    return payload;
+  }
+
+  const markets = {};
+  for (let i = 0; i < MARKET_SYMBOLS.length; i += 1) {
+    const def = MARKET_SYMBOLS[i];
+    markets[def.key] = fetchMarketSymbol(def.symbol, def.key, def.name, def.range);
+  }
+
+  const payload = {
+    markets: markets,
+    meta: { generatedAt: new Date().toISOString(), cacheHit: false },
+  };
+  cache.put(MARKET_CACHE_KEY, JSON.stringify(payload), MARKET_CACHE_TTL);
+  return payload;
+}
+
+function fetchMarketSymbol(symbol, key, name, range) {
+  const url = YAHOO_CHART_URL + encodeURIComponent(symbol) + "?interval=1d&range=" + range;
+  const response = fetchJson(url);
+
+  if (!response) {
+    return { key: key, name: name, status: "error", error: "FETCH_FAILED" };
+  }
+
+  const chart = response.chart;
+  if (!chart || chart.error || !chart.result || !chart.result[0]) {
+    return { key: key, name: name, status: "no_data", error: "NO_DATA" };
+  }
+
+  const node = chart.result[0];
+  const timestamps = Array.isArray(node.timestamp) ? node.timestamp : [];
+  const closes = node.indicators && node.indicators.quote && node.indicators.quote[0]
+    ? node.indicators.quote[0].close || []
+    : [];
+
+  const series = normalizeSeries(timestamps, closes);
+  if (series.timestamp.length === 0) {
+    return { key: key, name: name, status: "no_data", error: "NO_DATA" };
+  }
+
+  return {
+    key: key,
+    name: name,
+    status: "ok",
+    timestamp: series.timestamp,
+    close: series.close,
+    lastTradingDate: formatDate(series.timestamp[series.timestamp.length - 1]),
+  };
+}
+
+// ─── 時間觸發器管理 ───────────────────────────────────────────────────────────
+// 在 GAS 編輯器執行一次 setupTimeTrigger()，即可啟用每 10 分鐘自動預熱快取。
+// 要停止請執行 removeTimeTriggers()。
+
+/**
+ * 每 10 分鐘由觸發器呼叫，強制刷新 quotes 快取。
+ * 使用者按「更新」時必然命中快取，載入時間 < 1 秒。
+ */
+function refreshCacheOnSchedule() {
+  const cache = CacheService.getScriptCache();
+  cache.remove(QUOTES_CACHE_KEY);
+  cache.remove(MARKET_CACHE_KEY);
+  getQuotesBatch();
+  getMarketData();
+}
+
+/**
+ * 建立每 10 分鐘觸發一次的時間觸發器（執行前先移除舊的）。
+ * 在 GAS 編輯器手動執行此函式一次即可。
+ */
+function setupTimeTrigger() {
+  removeTimeTriggers();
+  ScriptApp.newTrigger("refreshCacheOnSchedule")
+    .timeBased()
+    .everyMinutes(10)
+    .create();
+  Logger.log("觸發器已建立，每 10 分鐘自動預熱快取。");
+}
+
+/**
+ * 移除所有 refreshCacheOnSchedule 觸發器。
+ */
+function removeTimeTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function(trigger) {
+    if (trigger.getHandlerFunction() === "refreshCacheOnSchedule") {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+  Logger.log("觸發器已移除。");
 }
