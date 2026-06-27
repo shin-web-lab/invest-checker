@@ -1,11 +1,6 @@
-const SPREADSHEET_ID = "REPLACE_ME";
-const SHEET_NAME = "REPLACE_ME";
-
-const TICKERS_CACHE_KEY = "tickers_cache_v2";
-const QUOTES_CACHE_KEY = "quotes_cache_v2";
+const QUOTES_CACHE_PREFIX = "quote_v3_";
+const QUOTES_CACHE_TTL = 600;
 const MARKET_CACHE_KEY = "market_cache_v1";
-const TICKERS_CACHE_TTL = 600;
-const QUOTES_CACHE_TTL = 600; // 延長至 10 分鐘，配合觸發器預熱頻率
 const MARKET_CACHE_TTL = 600;
 const ENABLE_YAHOO_FALLBACK = true;
 
@@ -22,332 +17,350 @@ const YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/";
 function doGet(e) {
   const params = e && e.parameter ? e.parameter : {};
   const action = params.action ? String(params.action) : "";
-  const code = params.code ? String(params.code).trim() : "";
-
-  if (action === "tickers") {
-    const listResult = getTickersFromSheet(true);
-    return jsonResponse({
-      tickers: listResult.tickers,
-      meta: {
-        generatedAt: new Date().toISOString(),
-        cacheHit: listResult.cacheHit,
-      },
-    });
-  }
 
   if (action === "quotes") {
-    return jsonResponse(getQuotesBatch());
+    const tickers = parseCodesParam(params.codes || "");
+    if (tickers.length === 0) {
+      return jsonResponse({
+        error: "Missing codes parameter",
+        expected: "action=quotes&codes=0050:twse:long,2330:twse:mid",
+      });
+    }
+    return jsonResponse(getQuotesBatch(tickers));
   }
 
   if (action === "market") {
     return jsonResponse(getMarketData());
   }
 
-  if (code) {
-    return jsonResponse(getSingleQuote(code));
-  }
-
   return jsonResponse({
     error: "Missing parameters",
-    expected: ["action=tickers|quotes"],
+    expected: ["action=quotes&codes=CODE:PROVIDER:STRATEGY,...", "action=market"],
     received: params,
   });
 }
 
-function getTickersFromSheet(onlyEnabled) {
+// codes 格式：CODE:PROVIDER:STRATEGY 以逗號分隔
+// 例：0050:twse:long,2330:twse:mid,6488:tpex:mid
+function parseCodesParam(codesStr) {
+  if (!codesStr) return [];
+  return String(codesStr).split(",")
+    .map(function(item) {
+      const parts = item.trim().split(":");
+      const code = String(parts[0] || "").trim();
+      if (!code || !/^[A-Za-z0-9]+$/.test(code)) return null;
+      const provider = normalizeProvider(parts[1] || "");
+      const strategyRaw = String(parts[2] || "").toLowerCase();
+      const strategy = ["long", "mid", "short"].includes(strategyRaw) ? strategyRaw : "mid";
+      return { code: code, provider: provider, strategy: strategy };
+    })
+    .filter(Boolean);
+}
+
+function getQuotesBatch(tickers) {
   const cache = CacheService.getScriptCache();
-  const cached = cache.get(TICKERS_CACHE_KEY);
-  if (cached) {
-    return { tickers: JSON.parse(cached), cacheHit: true };
+  const quotes = {};
+  const uncached = [];
+
+  // 逐一檢查 per-ticker 快取
+  tickers.forEach(function(ticker) {
+    const cached = cache.get(QUOTES_CACHE_PREFIX + ticker.code);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      parsed.cacheHit = true;
+      quotes[ticker.code] = parsed;
+    } else {
+      uncached.push(ticker);
+    }
+  });
+
+  if (uncached.length === 0) {
+    return { quotes: quotes, meta: { generatedAt: new Date().toISOString(), cacheHit: true } };
   }
 
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(SHEET_NAME);
-  if (!sheet) {
-    throw new Error("Sheet not found");
-  }
+  // 依 provider 分組，各自並行抓取
+  const twseTickers  = uncached.filter(function(t) { return t.provider === "twse"; });
+  const tpexTickers  = uncached.filter(function(t) { return t.provider === "tpex"; });
+  const yahooTickers = uncached.filter(function(t) { return t.provider === "yahoo"; });
+  const monthlyTickers = twseTickers.concat(tpexTickers);
 
-  const values = sheet.getDataRange().getValues();
-  if (values.length < 2) {
-    cache.put(TICKERS_CACHE_KEY, JSON.stringify([]), TICKERS_CACHE_TTL);
-    return { tickers: [], cacheHit: false };
-  }
-
-  const headers = values[0].map((v) => String(v).trim());
-  const codeIdx = headers.indexOf("code");
-  const nameIdx = headers.indexOf("name");
-  const strategyIdx = headers.indexOf("strategy");
-  const enabledIdx = headers.indexOf("enabled");
-  const providerIdx = headers.indexOf("provider");
-
-  if (codeIdx === -1 || nameIdx === -1 || enabledIdx === -1 || providerIdx === -1) {
-    throw new Error("Invalid headers");
-  }
-
-  const result = [];
-  for (let i = 1; i < values.length; i += 1) {
-    const row = values[i];
-    const hasData = row.some((cell) => cell !== "" && cell !== null && cell !== undefined);
-    if (!hasData) continue;
-
-    const enabled = row[enabledIdx] === true;
-    if (onlyEnabled && !enabled) continue;
-
-    const code = row[codeIdx] != null ? String(row[codeIdx]).trim() : "";
-    const name = row[nameIdx] != null ? String(row[nameIdx]).trim() : "";
-    const strategyRaw = strategyIdx !== -1 ? row[strategyIdx] : "";
-    const strategy = strategyRaw != null ? String(strategyRaw).trim().toLowerCase() : "";
-    const providerRaw = providerIdx !== -1 ? row[providerIdx] : "";
-    const provider = normalizeProvider(providerRaw);
-
-    if (!code) continue;
-
-    result.push({
-      code: code,
-      name: name,
-      strategy: strategy,
-      enabled: enabled,
-      provider: provider,
+  // TWSE + TPEX：單次 fetchAll 跨所有標的所有月份
+  if (monthlyTickers.length > 0) {
+    const monthlyResults = fetchMonthlyBatch(monthlyTickers);
+    Object.keys(monthlyResults).forEach(function(code) {
+      quotes[code] = monthlyResults[code];
     });
   }
 
-  cache.put(TICKERS_CACHE_KEY, JSON.stringify(result), TICKERS_CACHE_TTL);
-  return { tickers: result, cacheHit: false };
-}
-
-function getQuotesBatch() {
-  const cache = CacheService.getScriptCache();
-  const cached = cache.get(QUOTES_CACHE_KEY);
-  if (cached) {
-    const payload = JSON.parse(cached);
-    payload.meta = {
-      generatedAt: payload.meta && payload.meta.generatedAt ? payload.meta.generatedAt : new Date().toISOString(),
-      cacheHit: true,
-    };
-    return payload;
+  // Yahoo：單次 fetchAll 跨所有標的
+  if (yahooTickers.length > 0) {
+    const yahooResults = fetchYahooBatch(yahooTickers, false);
+    Object.keys(yahooResults).forEach(function(code) {
+      quotes[code] = yahooResults[code];
+    });
   }
 
-  const listResult = getTickersFromSheet(true);
-  const tickers = listResult.tickers;
-  const quotes = {};
-
-  for (let i = 0; i < tickers.length; i += 1) {
-    const ticker = tickers[i];
-    quotes[ticker.code] = fetchQuoteForTicker(ticker);
+  // Yahoo 備援：TWSE/TPEX 回 no_data 時自動嘗試 Yahoo
+  if (ENABLE_YAHOO_FALLBACK) {
+    const needsFallback = monthlyTickers.filter(function(t) {
+      return quotes[t.code] && quotes[t.code].status === "no_data";
+    });
+    if (needsFallback.length > 0) {
+      const fallbackResults = fetchYahooBatch(needsFallback, true);
+      needsFallback.forEach(function(t) {
+        if (fallbackResults[t.code] && fallbackResults[t.code].status === "ok") {
+          quotes[t.code] = fallbackResults[t.code];
+        }
+      });
+    }
   }
 
-  const payload = {
+  // 快取各標的結果，附假日保護：新資料若為 no_data 且舊快取為 ok，保留舊快取
+  uncached.forEach(function(ticker) {
+    const result = quotes[ticker.code];
+    if (!result) return;
+    const cacheKey = QUOTES_CACHE_PREFIX + ticker.code;
+    if (result.status === "no_data") {
+      const existing = cache.get(cacheKey);
+      if (existing) {
+        try {
+          const existingParsed = JSON.parse(existing);
+          if (existingParsed.status === "ok") return;
+        } catch (e) {}
+      }
+    }
+    try {
+      cache.put(cacheKey, JSON.stringify(result), QUOTES_CACHE_TTL);
+    } catch (e) {}
+  });
+
+  return {
     quotes: quotes,
-    meta: {
-      generatedAt: new Date().toISOString(),
-      cacheHit: false,
-    },
+    meta: { generatedAt: new Date().toISOString(), cacheHit: false },
   };
-
-  cache.put(QUOTES_CACHE_KEY, JSON.stringify(payload), QUOTES_CACHE_TTL);
-  return payload;
 }
 
-function getSingleQuote(code) {
-  const cleanCode = String(code || "").trim();
-  if (!cleanCode || cleanCode.includes(".")) {
-    return { error: "Code not allowed" };
-  }
+// 將所有 TWSE/TPEX 標的的所有月份 URL 合併成一次 fetchAll
+function fetchMonthlyBatch(tickers) {
+  const allRequests = [];
+  const requestMeta = [];
 
-  const listResult = getTickersFromSheet(true);
-  const tickers = listResult.tickers;
-  const ticker = tickers.find((item) => String(item.code || "").trim() === cleanCode);
-  if (!ticker) {
-    return { error: "Code not allowed" };
-  }
+  tickers.forEach(function(ticker) {
+    const provider = normalizeProvider(ticker.provider);
+    const strategy = String(ticker.strategy || "mid").toLowerCase();
+    const months = getRecentMonths(getMonthCountForStrategy(strategy));
 
-  return fetchQuoteForTicker(ticker);
-}
-
-function fetchQuoteForTicker(ticker) {
-  const provider = normalizeProvider(ticker.provider);
-  const strategy = String(ticker.strategy || "").toLowerCase();
-
-  let result = fetchByProvider(provider, ticker.code, strategy);
-  if (result.status === "ok") {
-    return result;
-  }
-
-  if (result.status === "no_data" && ENABLE_YAHOO_FALLBACK && provider !== "yahoo") {
-    const fallback = fetchFromYahoo(ticker.code, strategy, true);
-    if (fallback.status === "ok") {
-      fallback.source = "yahoo_fallback";
-      return fallback;
-    }
-  }
-
-  return result;
-}
-
-function fetchByProvider(provider, code, strategy) {
-  if (provider === "yahoo") {
-    return fetchFromYahoo(code, strategy, false);
-  }
-  if (provider === "tpex") {
-    return fetchFromTPEX(code, strategy);
-  }
-  return fetchFromTWSE(code, strategy);
-}
-
-function fetchFromTWSE(code, strategy) {
-  const months = getRecentMonths(getMonthCountForStrategy(strategy));
-  const urls = months.map((ym) => {
-    return `${TWSE_MONTHLY_URL}?response=json&date=${ym}01&stockNo=${encodeURIComponent(code)}`;
-  });
-  const rows = fetchMonthlyRows(urls, "TWSE");
-  return buildSeriesResult(rows, code, "twse");
-}
-
-function fetchFromTPEX(code, strategy) {
-  const months = getRecentMonths(getMonthCountForStrategy(strategy));
-  const urls = months.map((ym) => {
-    const roc = toRocYearMonth(ym);
-    return `${TPEX_MONTHLY_URL}?l=zh-tw&d=${roc}&stkno=${encodeURIComponent(code)}`;
-  });
-  const rows = fetchMonthlyRows(urls, "TPEX");
-  return buildSeriesResult(rows, code, "tpex");
-}
-
-function fetchFromYahoo(code, strategy, isFallback) {
-  const range = getYahooRange(strategy);
-  const symbols = buildYahooSymbols(code);
-
-  for (let i = 0; i < symbols.length; i += 1) {
-    const symbol = symbols[i];
-    const url = `${YAHOO_CHART_URL}${encodeURIComponent(symbol)}?interval=1d&range=${range}`;
-    const response = fetchJson(url);
-    if (!response) {
-      continue;
-    }
-
-    const chart = response.chart;
-    if (!chart || chart.error || !chart.result || !chart.result[0]) {
-      const errorMessage = chart && chart.error ? String(chart.error.description || "") : "";
-      if (errorMessage && errorMessage.toLowerCase().includes("no data")) {
-        continue;
+    months.forEach(function(ym) {
+      var url;
+      if (provider === "tpex") {
+        url = TPEX_MONTHLY_URL + "?l=zh-tw&d=" + toRocYearMonth(ym) + "&stkno=" + encodeURIComponent(ticker.code);
+      } else {
+        url = TWSE_MONTHLY_URL + "?response=json&date=" + ym + "01&stockNo=" + encodeURIComponent(ticker.code);
       }
-      if (i < symbols.length - 1) {
-        continue;
-      }
-      return {
-        code: code,
-        provider: "yahoo",
-        source: isFallback ? "yahoo_fallback" : "yahoo",
-        status: "error",
-        error: "UPSTREAM_ERROR",
-      };
+      allRequests.push({ url: url, method: "get", muteHttpExceptions: true, followRedirects: true });
+      requestMeta.push({ code: ticker.code, provider: provider });
+    });
+  });
+
+  const responses = UrlFetchApp.fetchAll(allRequests);
+
+  const rowsByCode = {};
+  const providerByCode = {};
+  tickers.forEach(function(t) {
+    rowsByCode[t.code] = [];
+    providerByCode[t.code] = normalizeProvider(t.provider);
+  });
+
+  responses.forEach(function(response, i) {
+    const meta = requestMeta[i];
+    if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) return;
+    const data = safeJsonParse(response.getContentText());
+    if (!data) return;
+
+    if (meta.provider === "tpex") {
+      const fields = data.fields || [];
+      const table = data.aaData || data.data;
+      if (!Array.isArray(table)) return;
+      const dIdx = fields.indexOf("日期") !== -1 ? fields.indexOf("日期") : 0;
+      const cIdx = fields.indexOf("收盤價") !== -1 ? fields.indexOf("收盤價") : 6;
+      table.forEach(function(row) { rowsByCode[meta.code].push({ date: row[dIdx], close: row[cIdx] }); });
+    } else {
+      const fields = data.fields || [];
+      const dateIdx = fields.indexOf("日期");
+      const closeIdx = fields.indexOf("收盤價");
+      if (dateIdx === -1 || closeIdx === -1 || !Array.isArray(data.data)) return;
+      data.data.forEach(function(row) { rowsByCode[meta.code].push({ date: row[dateIdx], close: row[closeIdx] }); });
     }
+  });
+
+  const results = {};
+  tickers.forEach(function(ticker) {
+    results[ticker.code] = buildSeriesResult(rowsByCode[ticker.code], ticker.code, providerByCode[ticker.code]);
+  });
+  return results;
+}
+
+// 將所有 Yahoo 標的的 .TW/.TWO 同時送出，取第一個有效回應
+function fetchYahooBatch(tickers, isFallback) {
+  const allRequests = [];
+  const requestMeta = [];
+
+  tickers.forEach(function(ticker) {
+    const strategy = String(ticker.strategy || "mid").toLowerCase();
+    const range = getYahooRange(strategy);
+    buildYahooSymbols(ticker.code).forEach(function(symbol, symIdx) {
+      const url = YAHOO_CHART_URL + encodeURIComponent(symbol) + "?interval=1d&range=" + range;
+      allRequests.push({ url: url, method: "get", muteHttpExceptions: true, followRedirects: true });
+      requestMeta.push({ code: ticker.code, symIdx: symIdx });
+    });
+  });
+
+  const responses = UrlFetchApp.fetchAll(allRequests);
+  const resultsByCode = {};
+
+  responses.forEach(function(response, i) {
+    const meta = requestMeta[i];
+    if (resultsByCode[meta.code] && resultsByCode[meta.code].status === "ok") return;
+    if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) return;
+
+    const data = safeJsonParse(response.getContentText());
+    if (!data) return;
+    const chart = data.chart;
+    if (!chart || chart.error || !chart.result || !chart.result[0]) return;
 
     const node = chart.result[0];
     const timestamps = Array.isArray(node.timestamp) ? node.timestamp : [];
     const closes = node.indicators && node.indicators.quote && node.indicators.quote[0]
       ? node.indicators.quote[0].close || []
       : [];
-
     const series = normalizeSeries(timestamps, closes);
-    if (series.timestamp.length === 0) {
-      continue;
-    }
+    if (series.timestamp.length === 0) return;
 
-    return finalizeSeries(code, series, isFallback ? "yahoo_fallback" : "yahoo");
-  }
+    const source = isFallback ? "yahoo_fallback" : "yahoo";
+    resultsByCode[meta.code] = finalizeSeries(meta.code, series, source);
+  });
 
-  return {
-    code: code,
-    provider: "yahoo",
-    source: "yahoo",
-    status: "no_data",
-    error: "NO_DATA",
-  };
-}
-
-function fetchMonthlyRows(urls, market) {
-  const rows = [];
-  const requests = urls.map((url) => ({
-    url: url,
-    method: "get",
-    muteHttpExceptions: true,
-    followRedirects: true,
-  }));
-
-  const responses = UrlFetchApp.fetchAll(requests);
-  for (let i = 0; i < responses.length; i += 1) {
-    const response = responses[i];
-    if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
-      continue;
-    }
-    const data = safeJsonParse(response.getContentText());
-    if (!data) continue;
-
-    if (market === "TWSE") {
-      const fields = data.fields || [];
-      const dateIdx = fields.indexOf("日期");
-      const closeIdx = fields.indexOf("收盤價");
-      if (dateIdx === -1 || closeIdx === -1 || !Array.isArray(data.data)) {
-        continue;
-      }
-      data.data.forEach((row) => {
-        rows.push({ date: row[dateIdx], close: row[closeIdx] });
-      });
-    }
-
-    if (market === "TPEX") {
-      const fields = data.fields || [];
-      const dateIdx = fields.indexOf("日期");
-      const closeIdx = fields.indexOf("收盤價");
-      const table = data.aaData || data.data;
-      if (!Array.isArray(table)) {
-        continue;
-      }
-      const dIdx = dateIdx !== -1 ? dateIdx : 0;
-      const cIdx = closeIdx !== -1 ? closeIdx : 6;
-      table.forEach((row) => {
-        rows.push({ date: row[dIdx], close: row[cIdx] });
-      });
-    }
-  }
-
-  return rows;
-}
-
-function buildSeriesResult(rows, code, source) {
-  if (!rows || rows.length === 0) {
-    return {
-      code: code,
-      provider: source,
-      source: source,
-      status: "no_data",
-      error: "NO_DATA",
-    };
-  }
-
-  const timestamps = [];
-  const closes = [];
-  rows.forEach((row) => {
-    const ts = parseDateToUnix(row.date);
-    const close = parseNumber(row.close);
-    if (ts && close) {
-      timestamps.push(ts);
-      closes.push(close);
+  // 沒取到資料的補 no_data
+  tickers.forEach(function(ticker) {
+    if (!resultsByCode[ticker.code]) {
+      const source = isFallback ? "yahoo_fallback" : "yahoo";
+      resultsByCode[ticker.code] = { code: ticker.code, provider: "yahoo", source: source, status: "no_data", error: "NO_DATA" };
     }
   });
 
-  const series = normalizeSeries(timestamps, closes);
-  if (series.timestamp.length === 0) {
-    return {
-      code: code,
-      provider: source,
-      source: source,
-      status: "no_data",
-      error: "NO_DATA",
-    };
+  return resultsByCode;
+}
+
+// ─── 市場總覽 ────────────────────────────────────────────────────────────────
+
+function getMarketData() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(MARKET_CACHE_KEY);
+  if (cached) {
+    const payload = JSON.parse(cached);
+    payload.meta.cacheHit = true;
+    return payload;
   }
 
+  const allRequests = MARKET_SYMBOLS.map(function(def) {
+    return {
+      url: YAHOO_CHART_URL + encodeURIComponent(def.symbol) + "?interval=1d&range=" + def.range,
+      method: "get",
+      muteHttpExceptions: true,
+      followRedirects: true,
+    };
+  });
+
+  const responses = UrlFetchApp.fetchAll(allRequests);
+  const markets = {};
+
+  MARKET_SYMBOLS.forEach(function(def, i) {
+    markets[def.key] = parseMarketResponse(responses[i], def);
+  });
+
+  const payload = {
+    markets: markets,
+    meta: { generatedAt: new Date().toISOString(), cacheHit: false },
+  };
+  cache.put(MARKET_CACHE_KEY, JSON.stringify(payload), MARKET_CACHE_TTL);
+  return payload;
+}
+
+function parseMarketResponse(response, def) {
+  if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
+    return { key: def.key, name: def.name, status: "error", error: "FETCH_FAILED" };
+  }
+  const data = safeJsonParse(response.getContentText());
+  if (!data) return { key: def.key, name: def.name, status: "error", error: "PARSE_FAILED" };
+
+  const chart = data.chart;
+  if (!chart || chart.error || !chart.result || !chart.result[0]) {
+    return { key: def.key, name: def.name, status: "no_data", error: "NO_DATA" };
+  }
+
+  const node = chart.result[0];
+  const timestamps = Array.isArray(node.timestamp) ? node.timestamp : [];
+  const closes = node.indicators && node.indicators.quote && node.indicators.quote[0]
+    ? node.indicators.quote[0].close || []
+    : [];
+  const series = normalizeSeries(timestamps, closes);
+  if (series.timestamp.length === 0) {
+    return { key: def.key, name: def.name, status: "no_data", error: "NO_DATA" };
+  }
+
+  return {
+    key: def.key,
+    name: def.name,
+    status: "ok",
+    timestamp: series.timestamp,
+    close: series.close,
+    lastTradingDate: formatDate(series.timestamp[series.timestamp.length - 1]),
+  };
+}
+
+// ─── 時間觸發器（僅預熱市場總覽） ─────────────────────────────────────────────
+
+function refreshCacheOnSchedule() {
+  const cache = CacheService.getScriptCache();
+  cache.remove(MARKET_CACHE_KEY);
+  getMarketData();
+}
+
+function setupTimeTrigger() {
+  removeTimeTriggers();
+  ScriptApp.newTrigger("refreshCacheOnSchedule")
+    .timeBased()
+    .everyMinutes(10)
+    .create();
+  Logger.log("觸發器已建立，每 10 分鐘自動預熱市場總覽快取。");
+}
+
+function removeTimeTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function(trigger) {
+    if (trigger.getHandlerFunction() === "refreshCacheOnSchedule") {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+  Logger.log("觸發器已移除。");
+}
+
+// ─── 共用工具函式 ─────────────────────────────────────────────────────────────
+
+function buildSeriesResult(rows, code, source) {
+  if (!rows || rows.length === 0) {
+    return { code: code, provider: source, source: source, status: "no_data", error: "NO_DATA" };
+  }
+  const timestamps = [];
+  const closes = [];
+  rows.forEach(function(row) {
+    const ts = parseDateToUnix(row.date);
+    const close = parseNumber(row.close);
+    if (ts && close) { timestamps.push(ts); closes.push(close); }
+  });
+  const series = normalizeSeries(timestamps, closes);
+  if (series.timestamp.length === 0) {
+    return { code: code, provider: source, source: source, status: "no_data", error: "NO_DATA" };
+  }
   return finalizeSeries(code, series, source);
 }
 
@@ -355,7 +368,6 @@ function finalizeSeries(code, series, source) {
   const lastTradingDate = series.timestamp.length > 0
     ? formatDate(series.timestamp[series.timestamp.length - 1])
     : null;
-
   return {
     code: code,
     provider: source,
@@ -403,14 +415,12 @@ function getYahooRange(strategy) {
 
 function buildYahooSymbols(code) {
   const upper = String(code || "").trim().toUpperCase();
-  return [`${upper}.TW`, `${upper}.TWO`];
+  return [upper + ".TW", upper + ".TWO"];
 }
 
 function normalizeProvider(value) {
   const raw = String(value || "").trim().toLowerCase();
-  if (raw === "twse" || raw === "tpex" || raw === "yahoo") {
-    return raw;
-  }
+  if (raw === "twse" || raw === "tpex" || raw === "yahoo") return raw;
   return "twse";
 }
 
@@ -455,13 +465,9 @@ function getRecentMonths(count) {
   let y = now.getFullYear();
   let m = now.getMonth() + 1;
   for (let i = 0; i < count; i += 1) {
-    const ym = `${y}${String(m).padStart(2, "0")}`;
-    months.push(ym);
+    months.push(y + String(m).padStart(2, "0"));
     m -= 1;
-    if (m === 0) {
-      m = 12;
-      y -= 1;
-    }
+    if (m === 0) { m = 12; y -= 1; }
   }
   return months;
 }
@@ -469,8 +475,7 @@ function getRecentMonths(count) {
 function toRocYearMonth(ym) {
   const year = Number(ym.slice(0, 4));
   const month = ym.slice(4, 6);
-  const rocYear = year - 1911;
-  return `${rocYear}/${month}`;
+  return (year - 1911) + "/" + month;
 }
 
 function formatDate(timestampSeconds) {
@@ -478,136 +483,15 @@ function formatDate(timestampSeconds) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function fetchJson(url) {
-  try {
-    const response = UrlFetchApp.fetch(url, {
-      method: "get",
-      muteHttpExceptions: true,
-      followRedirects: true,
-    });
-    const status = response.getResponseCode();
-    if (status < 200 || status >= 300) {
-      return null;
-    }
-    return safeJsonParse(response.getContentText());
-  } catch (err) {
-    return null;
-  }
+  return year + "-" + month + "-" + day;
 }
 
 function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch (err) {
-    return null;
-  }
+  try { return JSON.parse(text); } catch (e) { return null; }
 }
 
 function jsonResponse(payload) {
   return ContentService
     .createTextOutput(JSON.stringify(payload))
     .setMimeType(ContentService.MimeType.JSON);
-}
-
-// ─── 市場總覽 ────────────────────────────────────────────────────────────────
-
-function getMarketData() {
-  const cache = CacheService.getScriptCache();
-  const cached = cache.get(MARKET_CACHE_KEY);
-  if (cached) {
-    const payload = JSON.parse(cached);
-    payload.meta.cacheHit = true;
-    return payload;
-  }
-
-  const markets = {};
-  for (let i = 0; i < MARKET_SYMBOLS.length; i += 1) {
-    const def = MARKET_SYMBOLS[i];
-    markets[def.key] = fetchMarketSymbol(def.symbol, def.key, def.name, def.range);
-  }
-
-  const payload = {
-    markets: markets,
-    meta: { generatedAt: new Date().toISOString(), cacheHit: false },
-  };
-  cache.put(MARKET_CACHE_KEY, JSON.stringify(payload), MARKET_CACHE_TTL);
-  return payload;
-}
-
-function fetchMarketSymbol(symbol, key, name, range) {
-  const url = YAHOO_CHART_URL + encodeURIComponent(symbol) + "?interval=1d&range=" + range;
-  const response = fetchJson(url);
-
-  if (!response) {
-    return { key: key, name: name, status: "error", error: "FETCH_FAILED" };
-  }
-
-  const chart = response.chart;
-  if (!chart || chart.error || !chart.result || !chart.result[0]) {
-    return { key: key, name: name, status: "no_data", error: "NO_DATA" };
-  }
-
-  const node = chart.result[0];
-  const timestamps = Array.isArray(node.timestamp) ? node.timestamp : [];
-  const closes = node.indicators && node.indicators.quote && node.indicators.quote[0]
-    ? node.indicators.quote[0].close || []
-    : [];
-
-  const series = normalizeSeries(timestamps, closes);
-  if (series.timestamp.length === 0) {
-    return { key: key, name: name, status: "no_data", error: "NO_DATA" };
-  }
-
-  return {
-    key: key,
-    name: name,
-    status: "ok",
-    timestamp: series.timestamp,
-    close: series.close,
-    lastTradingDate: formatDate(series.timestamp[series.timestamp.length - 1]),
-  };
-}
-
-// ─── 時間觸發器管理 ───────────────────────────────────────────────────────────
-// 在 GAS 編輯器執行一次 setupTimeTrigger()，即可啟用每 10 分鐘自動預熱快取。
-// 要停止請執行 removeTimeTriggers()。
-
-/**
- * 每 10 分鐘由觸發器呼叫，強制刷新 quotes 快取。
- * 使用者按「更新」時必然命中快取，載入時間 < 1 秒。
- */
-function refreshCacheOnSchedule() {
-  const cache = CacheService.getScriptCache();
-  cache.remove(QUOTES_CACHE_KEY);
-  cache.remove(MARKET_CACHE_KEY);
-  getQuotesBatch();
-  getMarketData();
-}
-
-/**
- * 建立每 10 分鐘觸發一次的時間觸發器（執行前先移除舊的）。
- * 在 GAS 編輯器手動執行此函式一次即可。
- */
-function setupTimeTrigger() {
-  removeTimeTriggers();
-  ScriptApp.newTrigger("refreshCacheOnSchedule")
-    .timeBased()
-    .everyMinutes(10)
-    .create();
-  Logger.log("觸發器已建立，每 10 分鐘自動預熱快取。");
-}
-
-/**
- * 移除所有 refreshCacheOnSchedule 觸發器。
- */
-function removeTimeTriggers() {
-  ScriptApp.getProjectTriggers().forEach(function(trigger) {
-    if (trigger.getHandlerFunction() === "refreshCacheOnSchedule") {
-      ScriptApp.deleteTrigger(trigger);
-    }
-  });
-  Logger.log("觸發器已移除。");
 }

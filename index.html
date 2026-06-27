@@ -7,15 +7,56 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+
+  <!-- 側邊欄 -->
+  <div id="drawer-overlay" class="drawer-overlay"></div>
+  <div id="drawer" class="drawer">
+    <div class="drawer-header">
+      <span class="drawer-title">管理清單</span>
+      <button id="drawer-close" class="drawer-close-btn" type="button" aria-label="關閉">✕</button>
+    </div>
+
+    <div class="drawer-section">
+      <div class="drawer-section-title">新增股票</div>
+      <div class="drawer-form">
+        <div class="drawer-form-row">
+          <input id="input-code" class="drawer-input" type="text" placeholder="股票代碼（例：0050、2330）" maxlength="10" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false">
+        </div>
+        <div class="drawer-form-row">
+          <select id="input-strategy" class="drawer-select">
+            <option value="mid">中期（MA20，持有數週～數月）</option>
+            <option value="long">長期（MA60/120，持有數月以上）</option>
+            <option value="short">短期（MA10，持有數天～數週）</option>
+          </select>
+        </div>
+        <div id="drawer-error" class="drawer-form-error" hidden></div>
+        <button id="drawer-add-btn" class="drawer-add-btn" type="button">＋ 新增</button>
+      </div>
+    </div>
+
+    <div class="drawer-section">
+      <div class="drawer-section-title" id="drawer-list-title">追蹤中（0）</div>
+      <div id="drawer-list" class="drawer-list"></div>
+    </div>
+  </div>
+
   <div class="container">
-    <h1>投資標的每日檢查</h1>
+    <div class="top-bar">
+      <h1 class="top-bar-title">投資標的每日檢查</h1>
+      <div class="top-bar-actions">
+        <button id="manage-btn" type="button" class="btn-secondary">管理清單</button>
+        <button id="update-btn" type="button">更新</button>
+      </div>
+    </div>
+
     <div class="market-section">
       <div class="market-section-title">市場總覽</div>
       <div id="market-grid" class="market-grid"></div>
     </div>
-    <button id="update-btn" type="button">更新</button>
+
     <div id="error-box" class="error-banner" role="alert" hidden></div>
     <div id="cards" class="cards-grid"></div>
+
     <section class="info-section">
       <h2>使用說明</h2>
       <ul>
@@ -34,6 +75,7 @@
       <p class="info-note"><span class="alert-icon">!</span>本工具使用每日收盤價計算，建議於收盤後查看，一天看一次即可。</p>
     </section>
   </div>
+
   <script src="app.js" defer></script>
 
   <div id="bottom-sheet" hidden>
@@ -47,5 +89,6 @@
       <div id="bs-body" class="bs-body"></div>
     </div>
   </div>
+
 </body>
 </html>
