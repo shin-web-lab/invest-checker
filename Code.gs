@@ -237,7 +237,12 @@ function fetchYahooBatch(tickers, isFallback) {
     if (series.timestamp.length === 0) return;
 
     const source = isFallback ? "yahoo_fallback" : "yahoo";
-    resultsByCode[meta.code] = finalizeSeries(meta.code, series, source);
+    const result = finalizeSeries(meta.code, series, source);
+    if (node.meta && typeof node.meta.regularMarketPrice === "number") {
+      result.livePrice = node.meta.regularMarketPrice;
+      result.liveAsOf = node.meta.regularMarketTime ? new Date(node.meta.regularMarketTime * 1000).toISOString() : null;
+    }
+    resultsByCode[meta.code] = result;
   });
 
   // 沒取到資料的補 no_data
@@ -308,7 +313,7 @@ function parseMarketResponse(response, def) {
     return { key: def.key, name: def.name, status: "no_data", error: "NO_DATA" };
   }
 
-  return {
+  const result = {
     key: def.key,
     name: def.name,
     status: "ok",
@@ -316,6 +321,11 @@ function parseMarketResponse(response, def) {
     close: series.close,
     lastTradingDate: formatDate(series.timestamp[series.timestamp.length - 1]),
   };
+  if (node.meta && typeof node.meta.regularMarketPrice === "number") {
+    result.livePrice = node.meta.regularMarketPrice;
+    result.liveAsOf = node.meta.regularMarketTime ? new Date(node.meta.regularMarketTime * 1000).toISOString() : null;
+  }
+  return result;
 }
 
 // ─── 時間觸發器（僅預熱市場總覽） ─────────────────────────────────────────────
@@ -350,13 +360,17 @@ function buildSeriesResult(rows, code, source) {
   if (!rows || rows.length === 0) {
     return { code: code, provider: source, source: source, status: "no_data", error: "NO_DATA" };
   }
-  const timestamps = [];
-  const closes = [];
+  // 多個月份的資料是依月份分批 fetch 再串接，串接順序不保證由舊到新，
+  // 這裡依日期排序後才能正確取到「陣列最後一筆＝最新交易日」。
+  const parsed = [];
   rows.forEach(function(row) {
     const ts = parseDateToUnix(row.date);
     const close = parseNumber(row.close);
-    if (ts && close) { timestamps.push(ts); closes.push(close); }
+    if (ts && close) parsed.push({ ts: ts, close: close });
   });
+  parsed.sort(function(a, b) { return a.ts - b.ts; });
+  const timestamps = parsed.map(function(p) { return p.ts; });
+  const closes = parsed.map(function(p) { return p.close; });
   const series = normalizeSeries(timestamps, closes);
   if (series.timestamp.length === 0) {
     return { code: code, provider: source, source: source, status: "no_data", error: "NO_DATA" };
@@ -401,10 +415,12 @@ function getMonthCountForStrategy(strategy) {
   return months;
 }
 
+// 注意：這裡回傳的是「該策略前端最長會用到的均線天數」（如 mid 策略要顯示 60 日均線），
+// 用來決定要抓幾個月資料，並非「累積中」進度顯示用的門檻天數（那個門檻在 app.js 的 getStrategyPlan 另外定義）。
 function getRequiredDays(strategy) {
-  if (strategy === "short") return 11;
+  if (strategy === "short") return 20;
   if (strategy === "long") return 121;
-  return 21;
+  return 60;
 }
 
 function getYahooRange(strategy) {

@@ -1,5 +1,5 @@
 const GAS_ENDPOINT = "https://script.google.com/macros/s/AKfycbx37c_lGG8FHoIDSto_vctNcQFORV7GuEkTXKoUsgHasnbxE6kCYno8XY3MRTJlSywU/exec";
-const FETCH_TIMEOUT_MS = 12000;
+const FETCH_TIMEOUT_MS = 20000;
 const FETCH_RETRY = 2;
 const RETRY_BACKOFFS_MS = [800, 1600];
 
@@ -224,7 +224,7 @@ function buildMarketCard(def, data) {
 
   const closes = data.close || [];
   const n = closes.length;
-  const price = n > 0 ? closes[n - 1] : null;
+  const price = typeof data.livePrice === "number" ? data.livePrice : (n > 0 ? closes[n - 1] : null);
   if (price == null) {
     return `
       <div class="market-card">
@@ -395,7 +395,7 @@ function evaluateQuote(_ticker, quote, strategy) {
 
   const status = quote.status || "error";
   const source = quote.source || quote.provider || "unknown";
-  const lastTradingDate = quote.lastTradingDate || deriveLastTradingDate(quote.timestamp);
+  const lastTradingDate = buildLastTradingLabel(quote);
 
   if (status === "no_data") {
     return {
@@ -421,7 +421,7 @@ function evaluateQuote(_ticker, quote, strategy) {
 
   const closes = Array.isArray(quote.close) ? quote.close : [];
   const totalDays = closes.length;
-  const currentPrice = totalDays > 0 ? closes[totalDays - 1] : null;
+  const currentPrice = typeof quote.livePrice === "number" ? quote.livePrice : (totalDays > 0 ? closes[totalDays - 1] : null);
   const plan = getStrategyPlan(strategy, totalDays);
 
   if (currentPrice == null) {
@@ -693,6 +693,16 @@ function deriveLastTradingDate(timestamps) {
 
 function roundToTwo(num) {
   return Math.round(num * 100) / 100;
+}
+
+function buildLastTradingLabel(quote) {
+  const base = quote.lastTradingDate || deriveLastTradingDate(quote.timestamp);
+  if (typeof quote.livePrice === "number" && quote.liveAsOf) {
+    const d = new Date(quote.liveAsOf);
+    const timeStr = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+    return (base || "-") + "（即時 " + timeStr + "）";
+  }
+  return base;
 }
 
 function getErrorMessage(error) {
@@ -990,6 +1000,12 @@ function refreshCardsWithCache() {
   }
 
   // 背景靜默更新，完成後刷新卡片與側邊欄警示
+  attemptBackgroundRefresh(tickers, 1);
+}
+
+// 新增股票時尚無 GAS 快取，首次抓取（尤其多月資料）可能超過逾時時間而失敗，
+// 失敗後延遲重試一次，讓 GAS 端有機會完成處理並寫入快取，不用使用者手動按更新。
+function attemptBackgroundRefresh(tickers, retriesLeft) {
   fetchQuotes(tickers).then(function (payload) {
     if (payload && payload.quotes) {
       saveLocalCache(payload);
@@ -1000,5 +1016,10 @@ function refreshCardsWithCache() {
     }
   }).catch(function (err) {
     console.error("Background refresh error:", err);
+    if (retriesLeft > 0) {
+      setTimeout(function () {
+        attemptBackgroundRefresh(tickers, retriesLeft - 1);
+      }, 5000);
+    }
   });
 }
